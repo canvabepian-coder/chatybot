@@ -1,0 +1,46 @@
+# Dependency directories
+node_modules/
+jspm_packages/
+web_stage/
+
+# IDEs and editors
+.idea/
+.vscode/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# Operating System Files
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+# WhatsApp session and cache data
+.wwebjs_auth/
+.wwebjs_cache/
+
+# Local env files
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+
+# Vite / Build files
+dist/
+dist-ssr/
+*.local
+package-lock.json
+yarn.lock
+pnpm-lock.yaml
