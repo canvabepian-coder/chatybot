@@ -27,8 +27,13 @@ const delay = ms => new Promise(res => setTimeout(res, ms));
 // Inicializar whatsapp-web.js utilizando LocalAuth para mantener la sesión
 const client = new Client({
   authStrategy: new LocalAuth(),
+  webVersionCache: {
+    type: 'remote',
+    remotePath: 'https://raw.githubusercontent.com/wppconnect-team/wa-version/main/html/2.2412.54.html'
+  },
   puppeteer: {
     headless: true,
+    ignoreHTTPSErrors: true,
     args: [
       '--no-sandbox',
       '--disable-setuid-sandbox',
@@ -37,7 +42,9 @@ const client = new Client({
       '--no-first-run',
       '--no-zygote',
       '--single-process',
-      '--disable-gpu'
+      '--disable-gpu',
+      '--ignore-certificate-errors',
+      '--ignore-ssl-errors'
     ]
   }
 });
