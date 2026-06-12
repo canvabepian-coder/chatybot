@@ -3,6 +3,7 @@ const http = require('http');
 const { Server } = require('socket.io');
 const cors = require('cors');
 const { Client, LocalAuth, MessageMedia } = require('whatsapp-web.js');
+const db = require('./database');
 
 const app = express();
 const server = http.createServer(app);
@@ -18,13 +19,21 @@ app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ limit: '50mb', extended: true }));
 app.use(cors());
 
-// Variables de configuración en memoria (en segundos)
+// Variables de configuración en memoria (sincronizadas con base de datos)
 let autoResponseDelay = 3; 
+
+// Cargar autoResponseDelay inicial desde DB
+db.get("SELECT value FROM settings WHERE key = 'autoResponseDelay'", (err, row) => {
+  if (!err && row) {
+    autoResponseDelay = Number(row.value);
+    console.log(`autoResponseDelay inicializado desde DB: ${autoResponseDelay}s`);
+  }
+});
 
 // Helper de pausa
 const delay = ms => new Promise(res => setTimeout(res, ms));
 
-// Inicializar whatsapp-web.js utilizando LocalAuth para mantener la sesión
+// Inicializar whatsapp-web.js utilizando LocalAuth y webVersionCache
 const client = new Client({
   authStrategy: new LocalAuth(),
   webVersionCache: {
@@ -70,58 +79,74 @@ client.on('disconnected', (reason) => {
   console.log('Cliente de WhatsApp desconectado:', reason);
   isReady = false;
   io.emit('ready', false);
-  // Re-inicializar para volver a pedir QR
   client.initialize().catch(err => console.error('Error al re-inicializar:', err));
 });
 
-// Ejemplos de Multimedia Ficticios
-const DUMMY_IMAGE_BASE64 = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=='; // 1x1 Pixel
-const DUMMY_PDF_BASE64 = 'JVBERi0xLjQKMSAwIG9iagogIDw8IC9UeXBlIC9DYXRhbG9nCiAgICAgL1BhZ2VzIDIgMCBSCiAgPj4KZW5kb2JqCjIgMCBvYmogIDw8IC9UeXBlIC9QYWdlcwogICAgIC9LaWRzIFszIDAgUl0KICAgICAvQ291bnQgMQogID4+CmVuZG9iaiozIDAgb2JqCiAgPDwgL1R5cGUgL1BhZ2UKICAgICAvUGFyZW50IDIgMCBSCiAgICAgL01lZGlhQm94IFswIDAgNTk1IDg0Ml0KICAgICAvQ29udGVudHMgNCAwIFIKICAgICAvUmVzb3VyY2VzIDw8Pj4KICA+PgplbmRvYmoKNCAwIG9iagogIDw8IC9MZW5ndGggMTIgPj4Kc3RyZWFtCkJUCi9GMSAxMiBUZgplbmRzdHJlYW0KZW5kb2JqCnRyYWlsZXIKICA8PCAvUm9vdCAxIDAgUgoKICAgICAvU2l6ZSA1CiAgPj4KJSVFT0Y=';
-
-// Lógica de Auto-respuestas
+// Lógica de Auto-respuestas Dinámicas desde SQLite
 client.on('message', async (msg) => {
   const text = msg.body.toLowerCase().trim();
-  
-  if (text === 'hola' || text === 'precio' || text === 'imagen' || text === 'pdf') {
-    try {
-      const chat = await msg.getChat();
-      
-      // Activar estado de escritura
-      await chat.sendStateTyping();
-      
-      // Esperar los segundos configurados en autoResponseDelay
-      await delay(autoResponseDelay * 1000);
-      
-      if (text === 'hola') {
-        await msg.reply('¡Hola! Soy un bot automatizado. Puedes consultarme por:\n- *precio* (para ver tarifas)\n- *imagen* (para recibir una imagen de prueba)\n- *pdf* (para recibir un PDF de prueba)');
-      } else if (text === 'precio') {
-        await msg.reply('Nuestros precios varían según el plan. El plan básico empieza en $10 USD/mes.');
-      } else if (text === 'imagen') {
-        // Enviar imagen ficticia. Mostramos ejemplo con Caption
-        const media = new MessageMedia('image/png', DUMMY_IMAGE_BASE64, 'ejemplo.png');
-        await client.sendMessage(msg.from, media, { caption: 'Aquí tienes la imagen de prueba solicitada (Modo Caption).' });
-      } else if (text === 'pdf') {
-        // Enviar PDF de prueba. Mostramos ejemplo con envío Independiente
-        const media = new MessageMedia('application/pdf', DUMMY_PDF_BASE64, 'documento_ejemplo.pdf');
-        // Primero enviamos el archivo
-        await client.sendMessage(msg.from, media);
-        // Esperamos un momento y enviamos el texto independiente
-        await delay(500);
-        await client.sendMessage(msg.from, 'Aquí tienes el PDF de prueba solicitado (Modo Independiente).');
+
+  // Consultar todas las reglas de triggers guardadas en base de datos
+  db.all("SELECT * FROM triggers", async (err, rows) => {
+    if (err || !rows) return;
+
+    // Buscar coincidencia basada en el match_type
+    const matchedTrigger = rows.find(trigger => {
+      const keyword = trigger.keyword.toLowerCase().trim();
+      if (trigger.match_type === 'exact') {
+        return text === keyword;
+      } else if (trigger.match_type === 'contains') {
+        return text.includes(keyword);
       }
-      
-      // Detener estado de escritura
-      await chat.clearState();
-    } catch (err) {
-      console.error('Error al manejar auto-respuesta:', err);
+      return false;
+    });
+
+    if (matchedTrigger) {
+      try {
+        const chat = await msg.getChat();
+        
+        // Activar estado de escritura
+        await chat.sendStateTyping();
+        
+        // Esperar la demora configurada
+        await delay(autoResponseDelay * 1000);
+        
+        if (matchedTrigger.media_base64 && matchedTrigger.media_mimetype) {
+          const media = new MessageMedia(
+            matchedTrigger.media_mimetype,
+            matchedTrigger.media_base64,
+            matchedTrigger.media_filename || 'archivo'
+          );
+
+          if (matchedTrigger.is_caption) {
+            // Con caption
+            await client.sendMessage(msg.from, media, { caption: matchedTrigger.response_text || '' });
+          } else {
+            // Independiente
+            await client.sendMessage(msg.from, media);
+            if (matchedTrigger.response_text) {
+              await delay(500);
+              await client.sendMessage(msg.from, matchedTrigger.response_text);
+            }
+          }
+        } else if (matchedTrigger.response_text) {
+          // Solo texto
+          await client.sendMessage(msg.from, matchedTrigger.response_text);
+        }
+        
+        // Limpiar estado de escritura
+        await chat.clearState();
+        console.log(`Auto-respuesta disparada para: "${msg.body}" -> Trigger: "${matchedTrigger.keyword}"`);
+      } catch (err) {
+        console.error('Error al manejar auto-respuesta:', err);
+      }
     }
-  }
+  });
 });
 
 // Conexión Socket.io
 io.on('connection', (socket) => {
   console.log('Cliente Socket.io conectado:', socket.id);
-  // Enviar estado actual al conectarse
   socket.emit('ready', isReady);
   if (latestQr && !isReady) {
     socket.emit('qr', latestQr);
@@ -132,82 +157,168 @@ io.on('connection', (socket) => {
   });
 });
 
-// Endpoint para actualizar configuración en memoria
+// GET Settings
+app.get('/api/config', (req, res) => {
+  res.json({ autoResponseDelay, isReady });
+});
+
+// POST Settings
 app.post('/api/config', (req, res) => {
   const { autoResponseDelay: newDelay } = req.body;
   if (typeof newDelay === 'number' && newDelay >= 0) {
     autoResponseDelay = newDelay;
+    
+    db.run("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", ['autoResponseDelay', newDelay.toString()], (err) => {
+      if (err) {
+        console.error('Error al guardar config en DB:', err.message);
+      }
+    });
+
     console.log(`Configuración actualizada: autoResponseDelay = ${autoResponseDelay}s`);
     return res.json({ success: true, autoResponseDelay });
   }
   return res.status(400).json({ error: 'Parámetro inválido' });
 });
 
-// Endpoint para consultar configuración actual
-app.get('/api/config', (req, res) => {
-  res.json({ autoResponseDelay, isReady });
+// --- API CRUD para Triggers ---
+
+// Listar todos los disparadores
+app.get('/api/triggers', (req, res) => {
+  db.all("SELECT * FROM triggers ORDER BY id DESC", (err, rows) => {
+    if (err) {
+      return res.status(500).json({ error: err.message });
+    }
+    res.json(rows);
+  });
 });
 
-// Endpoint de Envío Masivo
-app.post('/api/send', async (req, res) => {
-  const { numbers, message, media, bulkDelay, isCaption } = req.body;
+// Crear o actualizar un disparador
+app.post('/api/triggers', (req, res) => {
+  const { id, keyword, match_type, response_text, media_base64, media_mimetype, media_filename, is_caption } = req.body;
 
-  if (!numbers || !Array.isArray(numbers) || numbers.length === 0) {
-    return res.status(400).json({ error: 'Debe proporcionar una lista de números en un array.' });
+  if (!keyword || !match_type || (!response_text && !media_base64)) {
+    return res.status(400).json({ error: 'Faltan parámetros obligatorios (palabra clave, coincidencia y contenido de respuesta).' });
   }
 
-  const delayTime = typeof bulkDelay === 'number' ? bulkDelay : 2; // por defecto 2 segundos
+  const captionVal = is_caption ? 1 : 0;
 
-  // Ejecutamos el envío masivo de forma asíncrona sin bloquear la respuesta HTTP
-  // Pero devolvemos una confirmación de que el proceso ha iniciado
-  res.json({ success: true, message: `Proceso de envío masivo iniciado para ${numbers.length} números.` });
+  if (id) {
+    // Editar
+    const query = `
+      UPDATE triggers 
+      SET keyword = ?, match_type = ?, response_text = ?, media_base64 = ?, media_mimetype = ?, media_filename = ?, is_caption = ?
+      WHERE id = ?
+    `;
+    db.run(query, [keyword, match_type, response_text, media_base64, media_mimetype, media_filename, captionVal, id], function(err) {
+      if (err) {
+        return res.status(500).json({ error: err.message });
+      }
+      res.json({ success: true, id });
+    });
+  } else {
+    // Crear (INSERT OR REPLACE)
+    const query = `
+      INSERT OR REPLACE INTO triggers (keyword, match_type, response_text, media_base64, media_mimetype, media_filename, is_caption)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+    `;
+    db.run(query, [keyword, match_type, response_text, media_base64, media_mimetype, media_filename, captionVal], function(err) {
+      if (err) {
+        return res.status(500).json({ error: err.message });
+      }
+      res.json({ success: true, id: this.lastID });
+    });
+  }
+});
 
-  for (let i = 0; i < numbers.length; i++) {
-    const rawNumber = numbers[i].replace(/[^\d]/g, '');
-    if (!rawNumber) continue;
+// Eliminar un disparador
+app.delete('/api/triggers/:id', (req, res) => {
+  const { id } = req.params;
+  db.run("DELETE FROM triggers WHERE id = ?", [id], function(err) {
+    if (err) {
+      return res.status(500).json({ error: err.message });
+    }
+    res.json({ success: true });
+  });
+});
 
-    // whatsapp-web.js requiere el formato 'numero@c.us'
-    const formattedNumber = `${rawNumber}@c.us`;
+// --- Fin API CRUD para Triggers ---
+
+// Endpoint de Envío Masivo con Variables Dinámicas
+app.post('/api/send', async (req, res) => {
+  const { contacts, template, media, bulkDelay, isCaption, countryCode } = req.body;
+
+  if (!contacts || !Array.isArray(contacts) || contacts.length === 0) {
+    return res.status(400).json({ error: 'Debe proporcionar una lista de contactos.' });
+  }
+
+  const delayTime = typeof bulkDelay === 'number' ? bulkDelay : 2;
+
+  // Devolver confirmación HTTP inmediata
+  res.json({ success: true, message: `Proceso de envío masivo iniciado para ${contacts.length} destinatarios.` });
+
+  for (let i = 0; i < contacts.length; i++) {
+    const contact = contacts[i];
+    
+    // Buscar la columna mapeada como teléfono. El frontend enviará los datos limpios.
+    // Pero por si acaso, soportamos "phone", "telefono", "celular", "número", etc.
+    let phoneKey = Object.keys(contact).find(k => k.toLowerCase() === 'phone' || k.toLowerCase() === 'telefono' || k.toLowerCase() === 'celular');
+    if (!phoneKey) {
+      // Si no hay clave explícita, tomamos la primera propiedad que parezca número telefónico
+      phoneKey = Object.keys(contact)[0];
+    }
+
+    const rawPhone = String(contact[phoneKey] || '').replace(/[^\d]/g, '');
+    if (!rawPhone) continue;
+
+    // Prepender el código de país opcional si no está presente
+    let targetPhone = rawPhone;
+    if (countryCode && !targetPhone.startsWith(countryCode)) {
+      targetPhone = countryCode + targetPhone;
+    }
+
+    const formattedNumber = `${targetPhone}@c.us`;
+
+    // Resolver la plantilla dinámicamente con los campos del contacto
+    let resolvedMessage = template || '';
+    Object.keys(contact).forEach(key => {
+      const regex = new RegExp(`{{\\s*${key}\\s*}}`, 'gi');
+      resolvedMessage = resolvedMessage.replace(regex, contact[key] || '');
+    });
 
     try {
       if (media && media.base64 && media.mimetype) {
-        // Logística multimedia
         const messageMedia = new MessageMedia(media.mimetype, media.base64, media.filename || 'archivo');
-        
         if (isCaption) {
-          // Modo Caption (integrado como pie de página del archivo)
-          await client.sendMessage(formattedNumber, messageMedia, { caption: message || '' });
+          await client.sendMessage(formattedNumber, messageMedia, { caption: resolvedMessage });
         } else {
-          // Modo Independiente (el archivo primero y el texto secuencialmente)
           await client.sendMessage(formattedNumber, messageMedia);
-          if (message) {
-            await delay(500); // Pequeño delay de cortesía entre el archivo y el texto
-            await client.sendMessage(formattedNumber, message);
+          if (resolvedMessage) {
+            await delay(500);
+            await client.sendMessage(formattedNumber, resolvedMessage);
           }
         }
-      } else if (message) {
-        // Solo texto
-        await client.sendMessage(formattedNumber, message);
+      } else if (resolvedMessage) {
+        await client.sendMessage(formattedNumber, resolvedMessage);
       }
-      console.log(`Mensaje enviado con éxito a: ${formattedNumber}`);
+      console.log(`Mensaje personalizado enviado a: ${formattedNumber}`);
     } catch (err) {
-      console.error(`Error al enviar mensaje a ${formattedNumber}:`, err);
+      console.error(`Error al enviar mensaje masivo personalizado a ${formattedNumber}:`, err);
     }
 
-    // Aplicar delay obligatorio entre cada número
-    if (i < numbers.length - 1) {
+    // Delay entre envíos masivos
+    if (i < contacts.length - 1) {
       console.log(`Esperando ${delayTime} segundos antes del siguiente envío...`);
       await delay(delayTime * 1000);
     }
   }
 });
 
-// Inicializar cliente de WhatsApp
+// Inicializar cliente
 client.initialize().catch(err => {
   console.error('Error al inicializar cliente de WhatsApp:', err);
 });
 
-// Iniciar servidor Express
+// Iniciar servidor
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
   console.log(`Servidor de Chatbot corriendo en el puerto ${PORT}`);
